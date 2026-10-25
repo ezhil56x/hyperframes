@@ -231,6 +231,67 @@ describe("resolveProxy on a long source", () => {
     expect(readdirSync(cacheDirectory)).toEqual([cachePath.split("/").at(-1)]);
   });
 
+  it("copies alpha pieces side by side, shares the cores out, and counts them together", async () => {
+    const { spawn, calls } = createSpawnSpy();
+    const { resolveProxy } = await loadModule(
+      spawn,
+      FFMPEG_PATH,
+      false,
+      null,
+      undefined,
+      LONG_SECONDS,
+    );
+    const projectDir = tmpProject();
+    const sourcePath = join(projectDir, "long.webm");
+    writeFileSync(sourcePath, "source-bytes");
+    const cores = availableParallelism();
+    const side = Math.min(4, cores, 3);
+
+    const heard: number[] = [];
+    const result = resolveProxy(projectDir, sourcePath, "vp8", undefined, {
+      onProgress: (progress) => heard.push(progress.doneSeconds),
+    });
+    await flush(50);
+
+    expect(calls).toHaveLength(side);
+    for (const call of calls) {
+      expect(call.args[call.args.indexOf("-threads") + 1]).toBe(
+        String(Math.min(4, Math.floor(cores / Math.min(4, cores)))),
+      );
+    }
+    calls[0]!.proc.stdout.emit("data", Buffer.from("out_time_us=4000000\n"));
+    if (side > 1) calls[1]!.proc.stdout.emit("data", Buffer.from("out_time_us=6000000\n"));
+    expect(heard.at(-1)).toBe(side > 1 ? 10 : 4);
+    await answerUntilIdle(calls, (call) => succeed(call, "fake-vp8-bytes"));
+    await result;
+    expect(heard.at(-1)).toBe(LONG_SECONDS);
+  });
+
+  it("ends the pieces still running when one of them fails, and reports that failure", async () => {
+    const { spawn, calls } = createSpawnSpy();
+    const { resolveProxy } = await loadModule(
+      spawn,
+      FFMPEG_PATH,
+      false,
+      null,
+      undefined,
+      LONG_SECONDS,
+    );
+    const projectDir = tmpProject();
+    const sourcePath = join(projectDir, "long.webm");
+    writeFileSync(sourcePath, "source-bytes");
+
+    const result = resolveProxy(projectDir, sourcePath, "vp8").catch((error: unknown) => error);
+    await flush(50);
+    fail(calls[0]!, 1, "bad piece");
+    await flush(50);
+    for (const call of calls.slice(1)) {
+      expect(call.options?.signal?.aborted).toBe(true);
+      call.proc.kill("SIGKILL");
+    }
+    expect(String(await result)).toContain("bad piece");
+  });
+
   it("keeps a short source to one pass", async () => {
     const { spawn, calls } = createSpawnSpy();
     const { resolveProxy } = await loadModule(spawn, FFMPEG_PATH, false, null, undefined, 20);

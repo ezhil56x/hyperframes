@@ -472,7 +472,12 @@ function chunkRanges(durationSeconds: number | undefined): ChunkRange[] | null {
   }));
 }
 
-type EncodeFn = (outputPath: string, range?: ChunkRange) => Promise<void>;
+type EncodeFn = (
+  outputPath: string,
+  range: ChunkRange | undefined,
+  signal: AbortSignal,
+  onEncoded: (encodedSeconds: number) => void,
+) => Promise<void>;
 
 /** Copies a long source in pieces that stay in the cache, so a stopped copy continues from the first missing one. */
 async function encodeInChunks(
@@ -481,28 +486,52 @@ async function encodeInChunks(
   tempPath: string,
   encode: EncodeFn,
   concat: (listPath: string, target: string) => Promise<void>,
+  signal: AbortSignal,
+  workers: number,
   onDone: (doneSeconds: number) => void = () => {},
 ): Promise<void> {
   const extension = extname(tempPath);
   const pieces = ranges.map((_, index) => `${chunkPrefix}${index}${extension}`);
+  const pending = ranges.flatMap((_, index) => (existsSync(pieces[index]!) ? [] : [index]));
   let doneSeconds = 0;
   for (const [index, range] of ranges.entries()) {
-    if (existsSync(pieces[index]!)) doneSeconds += range.lengthSeconds;
+    if (!pending.includes(index)) doneSeconds += range.lengthSeconds;
   }
   if (doneSeconds) onDone(doneSeconds);
-  for (const [index, range] of ranges.entries()) {
-    const piece = pieces[index]!;
-    if (existsSync(piece)) continue;
-    const pieceTemp = join(dirname(piece), `.tmp-${randomUUID()}-${basename(piece)}`);
-    try {
-      await encode(pieceTemp, range);
-      renameSync(pieceTemp, piece);
-      doneSeconds += range.lengthSeconds;
-      onDone(doneSeconds);
-    } finally {
-      if (existsSync(pieceTemp)) unlinkSync(pieceTemp);
+  const inFlight = new Map<number, number>();
+  const stop = new AbortController();
+  const pieceSignal = AbortSignal.any([signal, stop.signal]);
+  let failure: unknown;
+  let cursor = 0;
+  const work = async (): Promise<void> => {
+    while (cursor < pending.length) {
+      const index = pending[cursor++]!;
+      const range = ranges[index]!;
+      const piece = pieces[index]!;
+      const pieceTemp = join(dirname(piece), `.tmp-${randomUUID()}-${basename(piece)}`);
+      try {
+        await encode(pieceTemp, range, pieceSignal, (encodedSeconds) => {
+          inFlight.set(index, encodedSeconds);
+          onDone(doneSeconds + [...inFlight.values()].reduce((sum, seconds) => sum + seconds, 0));
+        });
+        renameSync(pieceTemp, piece);
+        inFlight.delete(index);
+        doneSeconds += range.lengthSeconds;
+        onDone(doneSeconds);
+      } finally {
+        if (existsSync(pieceTemp)) unlinkSync(pieceTemp);
+      }
     }
-  }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(workers, pending.length) }, () =>
+      work().catch((error: unknown) => {
+        failure ??= error;
+        stop.abort();
+      }),
+    ),
+  );
+  if (failure !== undefined) throw failure;
   const listDir = mkdtempSync(join(tmpdir(), "hf-proxy-join-"));
   try {
     const listPath = join(listDir, "pieces.txt");
@@ -542,7 +571,7 @@ const H264_ARGS = [
   "-movflags",
   "+faststart",
 ];
-const VP8_THREADS = String(Math.min(4, availableParallelism()));
+const CORES = availableParallelism();
 const VP8_ARGS = [
   "-c:v",
   "libvpx",
@@ -562,8 +591,6 @@ const VP8_ARGS = [
   "bt709",
   "-cpu-used",
   "4",
-  "-threads",
-  VP8_THREADS,
   "-auto-alt-ref",
   "0",
   "-metadata:s:v:0",
@@ -616,7 +643,13 @@ async function runFfmpeg(
   const alphaDecoder = keepsAlpha ? alphaDecoderFor(metadata.color.codecName) : null;
   const decoderArgs = alphaDecoder ? ["-c:v", alphaDecoder] : [];
   const totalSeconds = metadata.durationSeconds;
-  const encode: EncodeFn = (target, range) =>
+  // libvpx scales poorly across threads, so alpha pieces run side by side with the cores shared out.
+  const workers = keepsAlpha ? Math.min(4, CORES) : 1;
+  const vp8Threads = (pieces: number) => [
+    "-threads",
+    String(Math.min(4, Math.floor(CORES / pieces))),
+  ];
+  const encode: EncodeFn = (target, range, pieceSignal, onEncoded) =>
     spawnFfmpeg(
       ffmpegPath,
       [
@@ -631,16 +664,19 @@ async function runFfmpeg(
         ...(range ? ["-t", String(range.lengthSeconds)] : []),
         "-vf",
         videoFilter,
-        ...(variant === "vp8" ? VP8_ARGS : H264_ARGS),
+        ...(keepsAlpha ? [...VP8_ARGS, ...vp8Threads(range ? workers : 1)] : H264_ARGS),
         target,
       ],
       TRANSCODE_STALL_MS,
-      signal,
-      (encodedSeconds) =>
-        onProgress({ doneSeconds: (range?.startSeconds ?? 0) + encodedSeconds, totalSeconds }),
+      pieceSignal,
+      onEncoded,
     );
   const ranges = chunkRanges(totalSeconds);
-  if (!ranges) return encode(outputPath);
+  if (!ranges) {
+    return encode(outputPath, undefined, signal, (encodedSeconds) =>
+      onProgress({ doneSeconds: encodedSeconds, totalSeconds }),
+    );
+  }
   await encodeInChunks(
     ranges,
     chunkPrefix,
@@ -648,6 +684,8 @@ async function runFfmpeg(
     encode,
     (listPath, target) =>
       spawnFfmpeg(ffmpegPath, concatArgs(listPath, target, variant), CONCAT_TIMEOUT_MS, signal),
+    signal,
+    workers,
     (doneSeconds) => onProgress({ doneSeconds, totalSeconds }),
   );
 }
